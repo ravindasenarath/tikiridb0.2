@@ -1,0 +1,435 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/stat.h>
+#include "DB/getUsrPubKey.h"
+#include "generateTicket.h"
+#include "security/security.h"
+#include <openssl/evp.h>
+
+#include <openssl/aes.h>
+
+#include <netdb.h>
+#include <sys/timex.h>
+#include <time.h>
+
+
+#define BUFSIZE 8096
+
+
+static int count;
+
+unsigned char * encrypt_ticket (USR_TICKET ticket, unsigned char* sk1);
+void handle_request(int socketfd);
+void decryptTicketAndPrint(unsigned char * encryptedTicket, unsigned char* sk1);//Dubug purpose
+
+int main(int argc, char **argv){
+		
+	char *configfd = "wserver.cfg";
+	FILE *infile;
+	char line_buffer[BUFSIZE];
+	char line_number;
+	int para1=0,para2=0;
+	char webroot[256],portInS[10];
+
+	int port,listenfd,length,socketfd,pid;
+	
+	static struct sockaddr_in server_addr;
+	static struct sockaddr_in client_addr;
+	
+	memset(&server_addr, '0', sizeof(server_addr));
+        memset(&client_addr, '0', sizeof(client_addr));
+
+	/*if( argc < 3  || argc > 3 || !strcmp(argv[1], "-?") ){
+		printf("argument problem\n");
+		exit(0);
+	}*/
+	
+	//==========================  Read Config file for parameters  ================================
+	
+	infile = fopen(configfd, "r");
+	if (!infile) {
+		printf("Couldn't open file %s for reading.\n", configfd);
+		return 0;
+	}
+	
+	while(fgets(line_buffer, sizeof(line_buffer), infile) != NULL){
+		char key[256], value[256];
+
+		line_number++;
+		if(line_buffer[0] == '#') continue;
+
+		if(sscanf(line_buffer, "%s %s", key, value) != 2)
+		{
+			fprintf(stderr, "Syntax error reading config file, line %d\n", line_number);
+			continue;
+		}
+
+		//printf("Line %d:  Key %s Value %s\n", line_number, key, value);
+		
+		if(strcmp(key,"webroot") == 0){
+			strcpy(webroot, value);
+			para1 = 1;
+			//printf("Webroot stored -> %s\n",webroot);
+		}else if(strcmp(key,"port") == 0){
+			strcpy(portInS, value);
+			para2 = 1;
+			//printf("Port stored -> %s\n",portInS);
+		}else{
+			fprintf(stderr, "Config file is currupted\n");
+			exit(0);
+		}
+	}
+	
+	printf("Webroot file-> %s Port -> %s\n",webroot,portInS);
+	if(!para1){
+		printf("Couldn't read webroot from config file\n");
+		exit(1);
+	}
+	if(!para2){
+		printf("Couldn't read port from config file\n");
+		exit(1);
+	}
+	
+	//====================================================================================
+	
+	/*if(chdir(webroot) == -1){ 
+		printf("ERROR: Coudn't Change to web root directory %s\n",argv[2]);
+		exit(1);
+	}*/
+	if ((listenfd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
+            	printf("ERROR: System call socket \n");
+            	exit(1);
+        }
+        port = atoi(portInS);
+        if(port < 0 || port >60000){
+        	printf("ERROR: Invalid port %d, number (try 1->60000)\n", port);
+        }
+        
+	printf("Starting Server.........\n");
+        
+        server_addr.sin_family = AF_INET;
+	server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+	server_addr.sin_port = htons(port);
+	
+	bind(listenfd, (struct sockaddr*)&server_addr, sizeof(server_addr));
+	
+	if( listen(listenfd,64) <0){
+		printf("ERROR: ");
+	}
+	
+	printf("Server waiting on port %d.........\n",port);
+	
+	while(1){
+		length = sizeof(client_addr);
+		if((socketfd = accept(listenfd, (struct sockaddr *)&client_addr, &length)) < 0){
+			printf("ERROR: System call accept\n");
+		}
+		if((pid = fork()) < 0){
+			printf("ERROR: System call fork\n");
+		}else {
+			if(pid == 0) {
+				count++;  
+				(void)close(listenfd);
+				handle_request(socketfd);
+			} else { 
+				count++;  
+				(void)close(socketfd);
+			}
+		}
+	}
+}
+
+void printBinaryInHex(unsigned char * data, int size){
+	printf("Data in hex :\t");
+    	int j = 0;
+	while(j < size)
+	{
+    		printf("%02X ", data[j]);
+    		j++;
+	}
+	printf("\n");
+}
+
+void handle_request(int socketfd){
+	long ret;
+	char * publicKey = "";
+	unsigned char * sk1;
+	char * sk2;
+	char *encryptedSk2;
+	unsigned char * encryptedTicket;
+	char username[10];  
+	char sendBuff[2][1100];
+
+	static char buffer[BUFSIZE+1];
+
+	/* Read the request into the buffer */
+	ret =read(socketfd,buffer,BUFSIZE);
+	
+	if(ret == 0 || ret == -1){
+		printf("ERROR: Failed to read the request\n");
+		exit(1);
+	}
+	
+	/* Mark the end of the request with a null character */
+	if(ret > 0 && ret < BUFSIZE){
+		buffer[ret]=0;
+	}else{
+		buffer[0]=0;
+	}
+	
+	/* Read username from the request */
+	//printf("%s",buffer);
+	
+	//char *test = "-----BEGIN PUBLIC KEY-----\n";	
+	//encrypt_with_ha_pub_key(test);
+	
+	strcpy (username, buffer);
+	printf("\nUsername: %s\n", username);
+	
+	/* Validate username and if valid extract user details */
+	publicKey = getPublicKey(username); 
+	
+	
+	/* Decrypt SK1 by using HA's public key  */
+	sk1 = "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCp2w+8HUdECo8V5yuKYrWJmUbL\n"
+  	"tD6nSyVifN543axXvNSFzQfWNOGVkMsCo6W4hpl5eHv1p9Hqdcf/ZYQDWCK726u6\n"
+  	"hsZA81AblAOOXKaUaxvFC+ZKRJf+MtUGnv0v7CrGoblm1mMC/OQI1JfSsYi68Epn\n"
+  	"aOLepTZw+GLTnusQgwIDAQAB\n"; /////// TODO - remove this. need to get the real sk1  
+			
+		
+	if(strlen(publicKey) != 0)
+	{   
+	   USR_TICKET ticket;
+	   sk2 = generate_128_bit_aes_key();
+	   printf("Generated Secret Key 2 : \n");
+	   printBinaryInHex(sk2, 16);  
+	   
+	   ticket = generateUsrTicket(username, sk2, count);
+	   
+	   /****************************Debug purpose****************************/
+	   printf("--------------------------------\n");
+	   printf("Original ticketId: %d\n", ticket.ticketId);
+	   printf("Original username: %s\n", ticket.username);
+	   printf("Original date: %s\n", ticket.date);
+	   printf("Original Validity period: %d\n", ticket.validityPeriod);  
+	   printf("Original sk1: \n"); printBinaryInHex(ticket.sk2, 128);
+	   printf("--------------------------------\n");
+	   /*********************************************************************/
+	   
+	   /* Encrypt the ticket by SK1 - Symmetric encryption */
+	   encryptedTicket = encrypt_ticket (ticket, sk1);
+	   
+	   /* Encrypt the SK2 by public key */
+	   encryptedSk2 = encrypt_sk2 (sk2, publicKey);
+	   
+	   /* send both ticket and key to the user */
+	   //strcat (sendBuff[0], encryptedSk2);
+	   //strcat (sendBuff[1], encryptedTicket);
+	   printBinaryInHex((unsigned char *)&encryptedTicket, 134);
+	   
+           write(socketfd, encryptedTicket, 1072); 
+
+           printf("----- Sent ticket and SK2 to user --------\n");   
+           printf("Encrypted ticket at HA: \n");  
+           printf("Size of the ticket : %d\n", sizeof(USR_TICKET));
+           
+           
+           /////////////// decrypt part - this is done by node /////////////
+           //printf("original:\t");
+	   //printBinaryInHex((unsigned char *)&ticket, sizeof(USR_TICKET));
+	   decryptTicketAndPrint(encryptedTicket, sk1);
+	   
+	} else {
+		char* msg1 = "Not created. Access denied";
+		char* msg2 = "Not created. Access denied";
+	   	strcat (sendBuff[0], msg1);
+	  	strcat (sendBuff[1], msg2);
+	  	  
+           	write(socketfd, sendBuff, sizeof(sendBuff)); 
+	}
+	
+	sleep(1);
+	close(socketfd);
+	exit (1);
+}
+
+//by Ravinda
+/*****************  Dubug purpose function *************************/
+void decryptTicketAndPrint(unsigned char * ciphertext, unsigned char* sk1){
+
+	/*printf("encrypted:\t");
+	printBinaryInHex(encryptedTicket, 2000);
+
+	unsigned char * dec_out = malloc(sizeof(USR_TICKET));	
+	
+	AES_KEY dec_key;
+	    
+	AES_set_decrypt_key(sk1,128,&dec_key);
+	AES_decrypt(encryptedTicket, dec_out, &dec_key);
+	
+	printf("dycrypted:\t");
+	printBinaryInHex(dec_out, sizeof(USR_TICKET));
+	
+	USR_TICKET * ticket2 = (USR_TICKET *) dec_out;
+		
+	printf("--------------------------------\n");
+	printf("Decrypted ticketId: %d\n", ticket2->ticketId);
+	printf("Decrypted username: %s\n", ticket2->username);
+	printf("Decrypted date: %s\n", ticket2->date);
+	printf("Decrypted Validity period: %d\n", ticket2->validityPeriod);  
+	printf("Decrypted sk1: \n"); printBinaryInHex(ticket2->sk2, 128); */
+	
+	//free(&dec_out);
+	
+	EVP_CIPHER_CTX de;
+	EVP_CIPHER_CTX_init(&de);
+	const EVP_CIPHER *cipher_type;
+  	unsigned char *plaintext = NULL;
+	
+	unsigned char iv[] = { 0x00, 0x01, 0x02, 0x03,
+                         0x04, 0x05, 0x06, 0x07,
+                         0x08, 0x09, 0x0a, 0x0b,
+                         0x0c, 0x0d, 0x0e, 0x0f };
+                         
+        int plaintext_len = 0;
+      	int ciphertext_len = sizeof(USR_TICKET)+16;
+                         
+        plaintext = (unsigned char *) malloc(ciphertext_len);
+        int bytes_written = 0;
+        cipher_type = EVP_aes_128_cbc();
+        EVP_DecryptInit_ex(&de, cipher_type, NULL, sk1, iv);
+
+      	if(!EVP_DecryptInit_ex(&de, NULL, NULL, NULL, NULL)){
+        	printf("ERROR in EVP_DecryptInit_ex \n");
+        	//return 1;
+      	}
+      	
+      	
+      	if(!EVP_DecryptUpdate(&de,
+                            plaintext, &bytes_written,
+                            ciphertext, ciphertext_len)){
+        	printf("ERROR in EVP_DecryptUpdate\n");
+        	//return 1;
+      	}
+      	plaintext_len += bytes_written;
+      	
+      	if(!EVP_DecryptFinal_ex(&de,
+                              plaintext + bytes_written, &bytes_written)){
+        	printf("ERROR in EVP_DecryptFinal_ex\n");
+        	//return 1;
+      	}
+      	plaintext_len += bytes_written;
+
+      	EVP_CIPHER_CTX_cleanup(&de);
+      	
+      	//printf("input_len: %d, ciphertext_len: %d, plaintext_len: %d\n",
+          //input_len, ciphertext_len, plaintext_len);
+
+      	USR_TICKET * dyc = (USR_TICKET *)plaintext;
+      	printf("Username - %s\n", dyc->username);
+      	printf("Ticket Id - %d\n", dyc->ticketId);
+      	printf("Date - %s\n", dyc->date);
+      	printf("Original Validity period: %d\n", dyc->validityPeriod);  
+	printf("Original sk1: \n"); printBinaryInHex(dyc->sk2, 128);
+}
+
+static void hex_print(const void* pv, size_t len)
+{
+    const unsigned char * p = (const unsigned char*)pv;
+    if (NULL == pv)
+        printf("NULL");
+    else
+    {
+        size_t i = 0;
+        for (; i<len;++i)
+            printf("%02X ", *p++);
+    }
+    printf("\n");
+}
+
+
+/*****************  Encrypt ticket by using SK1  *********************/
+unsigned char * encrypt_ticket (USR_TICKET ticket, unsigned char* key)
+{
+	/*unsigned char * enc_out = malloc(sizeof(USR_TICKET)); 
+	
+     	AES_KEY enc_key;
+	
+	AES_set_encrypt_key(sk1, 128, &enc_key);
+	AES_encrypt((unsigned char *)&ticket, enc_out, &enc_key); 
+	
+	int i;
+	
+	printf("\nEncrypted ticket:\t");
+    	for(i=0;*(enc_out+i)!=0x00;i++)
+        	printf("%X ",*(enc_out+i));
+	printf("\n");
+	
+	return enc_out;*/
+	
+	EVP_CIPHER_CTX en;
+	EVP_CIPHER_CTX_init(&en);
+	const EVP_CIPHER *cipher_type;
+  	unsigned char *ciphertext = NULL;
+  	int input_len = 0;
+
+  	unsigned char iv[] = { 	0x00, 0x01, 0x02, 0x03,
+                         	0x04, 0x05, 0x06, 0x07,
+                         	0x08, 0x09, 0x0a, 0x0b,
+                         	0x0c, 0x0d, 0x0e, 0x0f };
+                         	
+        cipher_type = EVP_aes_128_cbc();
+        
+        EVP_EncryptInit_ex(&en, cipher_type, NULL, key, iv);
+        
+        static const int MAX_PADDING_LEN = 16;
+        input_len = sizeof(USR_TICKET) + 1;
+    	ciphertext = (unsigned char *) malloc(input_len + MAX_PADDING_LEN);
+    	
+    	/* allows reusing of 'e' for multiple encryption cycles */
+      	if(!EVP_EncryptInit_ex(&en, NULL, NULL, NULL, NULL)){
+        	printf("ERROR in EVP_EncryptInit_ex \n");
+        	//return 1;
+      	}
+      	
+      	int bytes_written = 0;
+      	int ciphertext_len = 0;
+      	if(!EVP_EncryptUpdate(&en, ciphertext, &bytes_written,
+                           (unsigned char *) &ticket, input_len) ) {
+        	printf("ERROR in EVP_EncryptUpdate \n");
+        	//return 1;
+      	}
+      	ciphertext_len += bytes_written;
+      	
+      	printf("Input len: %d, ciphertext_len: %d\n", input_len, ciphertext_len);
+      	
+      	if(!EVP_EncryptFinal_ex(&en, ciphertext + bytes_written,
+                              &bytes_written)){
+        	printf("ERROR in EVP_EncryptFinal_ex \n");
+        	//return 1;
+      	}
+      	ciphertext_len += bytes_written;
+
+      	EVP_CIPHER_CTX_cleanup(&en);
+
+      	printf("Input len: %d, ciphertext_len: %d\n", input_len, ciphertext_len);
+      	
+      	return ciphertext;
+} 
+
+
+
+
+/***
+http://stackoverflow.com/questions/9889492/how-to-do-encryption-using-aes-in-openssl
+
+**/

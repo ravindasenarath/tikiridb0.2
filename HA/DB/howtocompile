@@ -1,0 +1,25 @@
+First compile createDb.c to create database.
+
+gcc createDb.c -o obj `mysql_config --cflags --libs`
+
+
+
+
+--------------------------------------------------------------------
+
+Then compile getUsr.c
+
+gcc generateTicket.c -o objname  `mysql_config --cflags --libs`
+
+---------------------------------------------------------------------
+
+Mysql 5.1 :
+
+sudo /etc/init.d/mysql restart
+
+pwd for root: root
+
+--- To connect as root: ---
+
+mysql -u root -p
+

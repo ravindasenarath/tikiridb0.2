@@ -1,0 +1,36 @@
+* Generate a 1024bit RSA key pare
+
+openssl genrsa -out mykey.pem 1024
+
+* Extract public key from key fiel
+
+openssl rsautl -encryrsa -in mykey.pem -pubout > mykey.pub
+
+* Generate 128bit key (sk1)
+
+openssl rsautl -encryrand 128 > key1.bin
+
+* Encript sk1 with public key
+
+openssl rsautl -encryrsautl -encrypt -inkey mykey.pub -pubin -in key1.bin -out key1.bin.enc
+
+===============================================================================================
+
+* compile HA.c
+
+gcc HA.c DB/getUsrPubKey.c DB/calcDiff.c security/security.c generateTicket.c -o HA -lcrypto -lssl `mysql_config --cflags --libs`
+
+./HA
+
+* compile user.c
+
+gcc user.c -o user -lcrypto
+
+./user 127.0.0.1
+
+
+
+----------------- for test ----------------------------------
+
+gcc test.c -o HA -lcrypto -lssl `mysql_config --cflags --libs`
+
